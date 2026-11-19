@@ -67,16 +67,94 @@
   const LANE_FREQ = [523.25, 659.25, 783.99, 987.77]; // C5 E5 G5 B5
 
   function hitSound(lane, judge) {
-    const v = judge === 'perfect' ? 0.22 : 0.16;
-    blip(actx.currentTime, LANE_FREQ[lane], 0.12, v, 'triangle');
+    // 曲が鳴っているときは打鍵音を控えめにして、メロディに被らないようにする
+    const quiet = state && state.hasSong ? 0.5 : 1;
+    const v = (judge === 'perfect' ? 0.22 : 0.16) * quiet;
+    blip(actx.currentTime, LANE_FREQ[lane], 0.08, v, 'triangle');
   }
 
   function missSound() {
     blip(actx.currentTime, 110, 0.12, 0.08, 'sawtooth');
   }
 
+  // ---- 曲データ（メロディ/伴奏）再生 ----
+  // 譜面に melody / accomp を持たせると、Web Audioで鳴らして判定と同期する。
+  //   melody: [{ t: 秒, d: 長さ(秒), n: MIDIノート番号 または 配列(和音), v: 音量0-1(省略可) }]
+  // tは notes と同じく「譜面開始からの秒」。鳴る時刻は start + offset + t。
+  const TRACKS = [
+    { key: 'melody', wave: 'triangle', gain: 0.22 },
+    { key: 'accomp', wave: 'sine', gain: 0.14 },
+  ];
+
+  function midiFreq(n) {
+    return 440 * Math.pow(2, (n - 69) / 12);
+  }
+
+  function playNote(s, when, dur, midi, vel, wave, level) {
+    const o = actx.createOscillator();
+    const gn = actx.createGain();
+    o.type = wave;
+    o.frequency.setValueAtTime(midiFreq(midi), when);
+    const peak = Math.max(0.0002, level * (vel == null ? 0.8 : vel));
+    const end = when + Math.max(0.05, dur);
+    gn.gain.setValueAtTime(0.0001, when);
+    gn.gain.exponentialRampToValueAtTime(peak, when + 0.012);
+    gn.gain.exponentialRampToValueAtTime(peak * 0.6, when + Math.min(0.12, (end - when) * 0.5));
+    gn.gain.exponentialRampToValueAtTime(0.0001, end);
+    o.connect(gn).connect(s.master);
+    o.start(when);
+    o.stop(end + 0.03);
+  }
+
+  function prepareTracks(s) {
+    s.master = actx.createGain();
+    s.master.gain.value = 0.9;
+    s.master.connect(actx.destination);
+    s.tracks = TRACKS
+      .map((def) => ({
+        def,
+        events: (Array.isArray(s.chart[def.key]) ? s.chart[def.key] : [])
+          .slice()
+          .sort((a, b) => a.t - b.t),
+        idx: 0,
+      }))
+      .filter((tr) => tr.events.length > 0);
+    s.hasSong = s.tracks.length > 0;
+  }
+
+  function scheduleTracks(s) {
+    if (!s.hasSong) return;
+    const horizon = actx.currentTime + 0.5;
+    const base = s.start + (s.chart.offset || 0);
+    for (const tr of s.tracks) {
+      while (tr.idx < tr.events.length) {
+        const ev = tr.events[tr.idx];
+        const when = base + ev.t;
+        if (when > horizon) break;
+        tr.idx++;
+        if (when < actx.currentTime - 0.05) continue;   // 遅れすぎた音は捨てる
+        const notes = Array.isArray(ev.n) ? ev.n : [ev.n];
+        const level = tr.def.gain / Math.sqrt(notes.length);
+        for (const m of notes) {
+          playNote(s, Math.max(when, actx.currentTime), ev.d || 0.25, m, ev.v, tr.def.wave, level);
+        }
+      }
+    }
+  }
+
+  function songEnd(s) {
+    let end = 0;
+    for (const tr of s.tracks || []) {
+      const last = tr.events[tr.events.length - 1];
+      end = Math.max(end, last.t + (last.d || 0.25));
+    }
+    return end;
+  }
+
   // メトロノーム（拍の頭を少し強く）。先読みでスケジュール
   function scheduleClicks(s) {
+    // 曲データがあるときは既定で鳴らさない（chart.metronome:true で強制ON）
+    if (s.chart.metronome === false || (s.hasSong && s.chart.metronome !== true)) return;
     const spb = 60 / s.chart.bpm;
     const horizon = actx.currentTime + 0.3;
     while (true) {
@@ -106,6 +184,7 @@
       const b = document.createElement('button');
       b.type = 'button';
       b.className = 'chart-btn';
+      b.dataset.genre = c.genre || '';
       const t = document.createElement('span');
       t.className = 'chart-title';
       t.textContent = c.title;
@@ -113,6 +192,12 @@
       m.className = 'chart-meta';
       m.textContent = `BPM ${c.bpm} / ${c.notes.length} notes`;
       b.append(t, m);
+      if (c.composer) {
+        const cp = document.createElement('span');
+        cp.className = 'chart-composer';
+        cp.textContent = c.composer;
+        b.appendChild(cp);
+      }
       b.addEventListener('click', () => startGame(i));
       li.appendChild(b);
       list.appendChild(li);
@@ -142,10 +227,12 @@
       resolved: 0,
       endAt: 0,
     };
+    prepareTracks(state);
     const last = notes.length ? notes[notes.length - 1].t : 0;
-    state.endAt = state.start + (chart.offset || 0) + last + 1.2;
+    state.endAt = state.start + (chart.offset || 0) + Math.max(last, songEnd(state)) + 1.2;
 
     $('hud-title').textContent = chart.title;
+    $('hud').dataset.genre = chart.genre || '';
     $('hud-score').textContent = '0';
     $('hud-combo').textContent = '';
     judgeEl.textContent = '';
@@ -158,6 +245,11 @@
   function stopGame() {
     cancelAnimationFrame(rafId);
     rafId = 0;
+    if (state && state.master) {
+      // 予約済みの音を即座に切る
+      try { state.master.gain.cancelScheduledValues(actx.currentTime); state.master.gain.setValueAtTime(0, actx.currentTime); } catch (e) { /* noop */ }
+      state.master.disconnect();
+    }
     state = null;
   }
 
@@ -218,6 +310,7 @@
     const now = actx.currentTime;
 
     scheduleClicks(s);
+    scheduleTracks(s);
 
     for (const n of s.notes) {
       if (n.state === 'idle' && now - noteTime(s, n) > MISS_AFTER) {
